@@ -10,4 +10,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+dohee-tools = { path = "../dohee-tools" }
+async-trait = { workspace = true }
 tokio = { workspace = true }

@@ -351,6 +351,8 @@ name = "dohee-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "dohee-tools",
  "serde",
  "serde_json",
  "thiserror",
