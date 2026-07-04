@@ -374,6 +374,7 @@ name = "dohee-store"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dohee-context",
  "rusqlite",
  "serde",
  "serde_json",
