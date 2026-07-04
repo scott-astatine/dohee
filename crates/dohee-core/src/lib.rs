@@ -235,7 +235,7 @@ impl<'a> Agent<'a> {
                 let mut sampler = if self.use_grammar {
                     let grammar_str = r#"
 root ::= (text | tool-call)*
-text ::= [^<]+
+text ::= ([^<] | "<" [^lrew/])+
 tool-call ::= list-dir | read-file | write-file | edit-file | run-shell
 list-dir ::= "<list_dir>" [^<]* "</list_dir>"
 read-file ::= "<read_file>" [^<]* "</read_file>"
