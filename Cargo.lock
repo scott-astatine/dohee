@@ -278,6 +278,7 @@ dependencies = [
  "dohee-store",
  "dohee-tools",
  "dohee-tui",
+ "llama-cpp-2",
  "tokio",
 ]
 
