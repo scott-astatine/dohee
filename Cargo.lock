@@ -401,7 +401,17 @@ name = "dohee-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "crossterm",
+ "dohee-config",
+ "dohee-context",
+ "dohee-core",
+ "dohee-infer",
+ "dohee-sandbox",
+ "dohee-tools",
+ "llama-cpp-2",
  "ratatui",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
 ]

@@ -171,7 +171,7 @@ async fn main() -> Result<()> {
     // Determine the command
     let command_to_run = if let Some(cmd) = cli.command {
         Some(cmd)
-    } else if let Some(raw_prompt) = cli.prompt {
+    } else if let Some(raw_prompt) = cli.prompt.clone() {
         Some(Commands::Run { prompt: raw_prompt })
     } else {
         None
@@ -179,7 +179,8 @@ async fn main() -> Result<()> {
 
     match command_to_run {
         Some(Commands::Chat) => {
-            println!("Interactive TUI chat mode is a stub for now. Will be fully wired in Phase 11.");
+            println!("Launching interactive TUI chat...");
+            dohee_tui::run_tui(config, cli.prompt).await?;
         }
         Some(Commands::Run { prompt }) => {
             let session_id = format!(

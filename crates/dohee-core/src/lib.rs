@@ -11,6 +11,18 @@ pub struct ParsedToolCall {
     pub args: serde_json::Value,
 }
 
+#[derive(Debug)]
+pub enum AgentEvent {
+    Token(String),
+    Status(String),
+    ToolRequest {
+        name: String,
+        args: serde_json::Value,
+        approve_tx: tokio::sync::oneshot::Sender<bool>,
+    },
+    Finished,
+}
+
 pub struct Agent<'a> {
     pub model: &'a dohee_infer::DoheeModel,
     pub backend: &'a llama_cpp_2::llama_backend::LlamaBackend,
@@ -20,6 +32,7 @@ pub struct Agent<'a> {
     pub temperature: f32,
     pub seed: u32,
     pub use_grammar: bool,
+    pub event_tx: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
 }
 
 pub fn system_prompt(tools: &[Arc<dyn dohee_tools::Tool>]) -> String {
@@ -192,6 +205,7 @@ impl<'a> Agent<'a> {
             temperature: 0.2,
             seed: 1234,
             use_grammar: true,
+            event_tx: None,
         }
     }
 
@@ -201,43 +215,56 @@ impl<'a> Agent<'a> {
         loop {
             if turn >= self.max_turns {
                 println!("[Agent] Maximum turn count reached ({}). Stopping.", self.max_turns);
+                if let Some(ref tx) = self.event_tx {
+                    let _ = tx.send(AgentEvent::Finished);
+                }
                 break;
             }
             
             println!("\n[Agent] Running turn {}/{}...", turn + 1, self.max_turns);
+            if let Some(ref tx) = self.event_tx {
+                let _ = tx.send(AgentEvent::Status(format!("Turn {}/{}...", turn + 1, self.max_turns)));
+            }
             let prompt = format_messages(messages);
-            
-            let mut session = do_infer::InferenceSession::new(self.backend, self.model, ctx_size, threads)
-                .context("Failed to construct inference session")?;
-            session.advance(self.model, &prompt).context("Failed to process prompt")?;
-            
-            let mut sampler = if self.use_grammar {
-                let grammar_str = r#"
+                 let mut completion = String::new();
+            {
+                let mut session = do_infer::InferenceSession::new(self.backend, self.model, ctx_size, threads)
+                    .context("Failed to construct inference session")?;
+                session.advance(self.model, &prompt).context("Failed to process prompt")?;
+                
+                let mut sampler = if self.use_grammar {
+                    let grammar_str = r#"
 root ::= (text | tool-call)*
 text ::= [^<]+
 tool-call ::= list-dir | read-file | write-file | edit-file | run-shell
 list-dir ::= "<list_dir>" [^<]* "</list_dir>"
 read-file ::= "<read_file>" [^<]* "</read_file>"
 write-file ::= "<write_file path=\"" [^\"]* "\">" [^<]* "</write_file>"
-edit-file ::= "<edit_file path=\"" [^\"]* "\">" "<find>" [^<]* "</find>" "<replace>" [^<]* "</replace>" "</edit_file>"
+edit-file ::= "<edit_file path=\"" [^\"]* "\">" "<find>" [^<]* "</find>" "<replace>" [^\<]* "</replace>" "</edit_file>"
 run-shell ::= "<run_shell>" [^<]* "</run_shell>"
 "#;
-                do_infer::grammar_sampler(self.model, self.seed, self.temperature, grammar_str)
-                    .context("Failed to construct grammar sampler")?
-            } else {
-                do_infer::default_sampler(self.seed, self.temperature)
-            };
-            
-            let mut completion = String::new();
-            print!("Response: ");
-            std::io::stdout().flush()?;
-            
-            while let Some(piece) = session.sample_next(self.model, &mut sampler).context("Failed to sample next token")? {
-                print!("{}", piece);
+                    do_infer::grammar_sampler(self.model, self.seed, self.temperature, grammar_str)
+                        .context("Failed to construct grammar sampler")?
+                } else {
+                    do_infer::default_sampler(self.seed, self.temperature)
+                };
+                
+                print!("Response: ");
                 std::io::stdout().flush()?;
-                completion.push_str(&piece);
+                
+                if let Some(ref tx) = self.event_tx {
+                    let _ = tx.send(AgentEvent::Status("Model generating response...".to_string()));
+                }
+
+                while let Some(piece) = session.sample_next(self.model, &mut sampler).context("Failed to sample next token")? {
+                    print!("{}", piece);
+                    std::io::stdout().flush()?;
+                    completion.push_str(&piece);
+                    if let Some(ref tx) = self.event_tx {
+                        let _ = tx.send(AgentEvent::Token(piece.clone()));
+                    }
+                }
             }
-            println!();
 
             // 1. Validate tag formatting
             if let Some(format_error) = validate_formatting(&completion) {
@@ -282,13 +309,26 @@ run-shell ::= "<run_shell>" [^<]* "</run_shell>"
                 };
 
                 let approved = if requires_approval {
-                    ask_user_approval(&call.name, &call.args)
+                    if let Some(ref tx) = self.event_tx {
+                        let (approve_tx, approve_rx) = tokio::sync::oneshot::channel();
+                        let _ = tx.send(AgentEvent::ToolRequest {
+                            name: call.name.clone(),
+                            args: call.args.clone(),
+                            approve_tx,
+                        });
+                        approve_rx.await.unwrap_or(false)
+                    } else {
+                        ask_user_approval(&call.name, &call.args)
+                    }
                 } else {
                     true
                 };
 
                 if !approved {
                     println!("[Agent] Tool call '{}' denied by user.", call.name);
+                    if let Some(ref tx) = self.event_tx {
+                        let _ = tx.send(AgentEvent::Status(format!("Tool '{}' execution denied.", call.name)));
+                    }
                     messages.push(Message {
                         role: "tool".to_string(),
                         content: format!("Error: Tool '{}' execution denied by user.", call.name),
@@ -298,6 +338,9 @@ run-shell ::= "<run_shell>" [^<]* "</run_shell>"
                 }
 
                 println!("[Agent] Executing '{}'...", call.name);
+                if let Some(ref tx) = self.event_tx {
+                    let _ = tx.send(AgentEvent::Status(format!("Executing tool '{}'...", call.name)));
+                }
                 if let Some(tool) = self.registry.get(&call.name) {
                     match tool.execute(call.args.clone()).await {
                         Ok(output) => {

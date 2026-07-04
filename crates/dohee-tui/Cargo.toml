@@ -7,6 +7,16 @@ authors.workspace = true
 
 [dependencies]
 ratatui = { workspace = true }
+crossterm = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+dohee-core = { path = "../dohee-core" }
+dohee-context = { path = "../dohee-context" }
+dohee-sandbox = { path = "../dohee-sandbox" }
+dohee-tools = { path = "../dohee-tools" }
+dohee-infer = { path = "../dohee-infer" }
+dohee-config = { path = "../dohee-config" }
+llama-cpp-2 = { workspace = true }
