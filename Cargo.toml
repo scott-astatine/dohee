@@ -46,3 +46,9 @@ encoding_rs = "0.8"
 tempfile = "3.10"
 async-trait = "0.1"
 crossterm = "0.27"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

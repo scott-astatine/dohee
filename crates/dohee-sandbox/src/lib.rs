@@ -14,6 +14,15 @@ pub enum SandboxPolicy {
 
 pub struct Sandbox;
 
+pub fn check_support() -> Result<()> {
+    let abi = ABI::V1;
+    let access_all = AccessFs::from_all(abi);
+    Ruleset::default()
+        .handle_access(access_all)?
+        .create()?;
+    Ok(())
+}
+
 impl Sandbox {
     pub fn apply(policy: &SandboxPolicy) -> Result<Option<RestrictionStatus>> {
         match policy {

@@ -61,6 +61,8 @@ enum Commands {
         /// The session ID to resume
         session_id: String,
     },
+    /// Check system hardware, model path, Vulkan compatibility, and sandbox support
+    Doctor,
 }
 
 fn get_config_paths() -> (Option<PathBuf>, Option<PathBuf>) {
@@ -264,6 +266,54 @@ async fn main() -> Result<()> {
             } else {
                 println!("Error: Session '{}' not found in store.", session_id);
             }
+        }
+        Some(Commands::Doctor) => {
+            println!("=== Dohee Doctor Diagnostic Report ===");
+            println!("OS:             {}", std::env::consts::OS);
+            println!("Arch:           {}", std::env::consts::ARCH);
+            println!("--------------------------------------");
+
+            // 1. Check Config & Model path
+            print!("Checking model path... ");
+            if let Some(ref model_path) = config.model_path {
+                if model_path.exists() {
+                    println!("OK (Exists at: {})", model_path.display());
+                } else {
+                    println!("ERROR (Path specified but file not found: {})", model_path.display());
+                }
+            } else {
+                println!("WARNING (No model path specified in configuration)");
+            }
+
+            // 2. Check Backend
+            print!("Initializing llama.cpp backend... ");
+            match LlamaBackend::init() {
+                Ok(_) => {
+                    println!("OK (LlamaBackend initialized successfully)");
+                }
+                Err(e) => {
+                    println!("ERROR (Failed to initialize llama.cpp backend: {:?})", e);
+                }
+            }
+
+            // 3. Check Sandboxing Support (Landlock)
+            print!("Checking Landlock sandboxing support... ");
+            #[cfg(target_os = "linux")]
+            {
+                match do_sandbox::check_support() {
+                    Ok(_) => {
+                        println!("OK (Landlock is supported and active on this kernel)");
+                    }
+                    Err(e) => {
+                        println!("WARNING (Landlock not supported or failed to initialize: {:?})", e);
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                println!("UNSUPPORTED (Landlock LSM sandboxing is only available on Linux)");
+            }
+            println!("--------------------------------------");
         }
         None => {
             println!("No subcommand or prompt provided. Run 'dohee --help' for details.");
