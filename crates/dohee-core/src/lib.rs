@@ -32,6 +32,7 @@ pub struct Agent<'a> {
     pub max_turns: u32,
     pub temperature: f32,
     pub seed: u32,
+    pub use_grammar: bool,
 }
 
 pub fn system_prompt(tools: &[Arc<dyn dohee_tools::Tool>]) -> String {
@@ -203,6 +204,7 @@ impl<'a> Agent<'a> {
             max_turns: 10,
             temperature: 0.2,
             seed: 1234,
+            use_grammar: true,
         }
     }
 
@@ -222,7 +224,22 @@ impl<'a> Agent<'a> {
                 .context("Failed to construct inference session")?;
             session.advance(self.model, &prompt).context("Failed to process prompt")?;
             
-            let mut sampler = do_infer::default_sampler(self.seed, self.temperature);
+            let mut sampler = if self.use_grammar {
+                let grammar_str = r#"
+root ::= (text | tool-call)*
+text ::= [^<]+
+tool-call ::= list-dir | read-file | write-file | edit-file | run-shell
+list-dir ::= "<list_dir>" [^<]* "</list_dir>"
+read-file ::= "<read_file>" [^<]* "</read_file>"
+write-file ::= "<write_file path=\"" [^\"]* "\">" [^<]* "</write_file>"
+edit-file ::= "<edit_file path=\"" [^\"]* "\">" "<find>" [^<]* "</find>" "<replace>" [^<]* "</replace>" "</edit_file>"
+run-shell ::= "<run_shell>" [^<]* "</run_shell>"
+"#;
+                do_infer::grammar_sampler(self.model, self.seed, self.temperature, grammar_str)
+                    .context("Failed to construct grammar sampler")?
+            } else {
+                do_infer::default_sampler(self.seed, self.temperature)
+            };
             
             let mut completion = String::new();
             print!("Response: ");

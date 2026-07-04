@@ -142,3 +142,27 @@ pub fn default_sampler(seed: u32, temperature: f32) -> LlamaSampler {
         ])
     }
 }
+
+pub fn grammar_sampler(
+    model: &DoheeModel,
+    seed: u32,
+    temperature: f32,
+    grammar_str: &str,
+) -> Result<LlamaSampler> {
+    let sampler = LlamaSampler::grammar(&model.model, grammar_str, "root")
+        .context("Failed to construct grammar sampler")?;
+    
+    if temperature <= 0.0 {
+        Ok(LlamaSampler::chain_simple([
+            sampler,
+            LlamaSampler::greedy(),
+        ]))
+    } else {
+        Ok(LlamaSampler::chain_simple([
+            LlamaSampler::temp(temperature),
+            LlamaSampler::dist(seed),
+            sampler,
+            LlamaSampler::greedy(),
+        ]))
+    }
+}
