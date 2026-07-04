@@ -14,3 +14,21 @@ Dohee is a local-first coding assistant agent.
 - **`dohee-config`**: Manages the configuration schemas and loading hierarchy for the project. It merges built-in settings with global config files (`~/.config/dohee/config.toml`) and project-specific files (`.dohee.toml`).
 - **`dohee-tui`**: Provides an interactive terminal user interface built on `ratatui`. It displays session history panels, live token usage meters, and interactive approval menus for agent tool invocations.
 - **`dohee-cli`**: The binary entrypoint for the `dohee` executable. It handles CLI arguments (via `clap`), initializes the required configurations, spins up selected interfaces (CLI or TUI), and drives the session.
+
+## Baseline Performance Benchmarks
+
+Measured on an Intel Iris Xe + NVIDIA GeForce GTX 1650 (Optimus) laptop using the **Qwen 2.5 1.5B Instruct (Q4_K_M)** model:
+
+### Generation Speed (1-Paragraph Generation, ~160 tokens)
+*   **Vulkan GPU Backend (`-b vulkan -g 99`)**:
+    *   Total Execution Time: **76.89 seconds**
+    *   Approximate Throughput: **2.1 tokens/sec** (including Vulkan driver initialization and GGUF loading overhead)
+*   **CPU-only Backend (`-b cpu`)**:
+    *   Total Execution Time: **91.41 seconds**
+    *   Approximate Throughput: **1.7 tokens/sec**
+
+### Resource Utilization
+*   **Vulkan VRAM footprint (1.5B Q4_K_M)**: ~934 MiB
+*   **Context limits tested**: up to 2048 context length
+*   **Sandboxing overhead**: < 5ms startup delay during Landlock policy restriction application.
+
