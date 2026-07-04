@@ -12,6 +12,7 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+dohee-sandbox = { path = "../dohee-sandbox" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -319,6 +319,11 @@ name = "dohee-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dohee-infer",
+ "dohee-sandbox",
+ "dohee-tools",
+ "llama-cpp-2",
+ "regex",
  "serde",
  "serde_json",
  "thiserror",
@@ -379,6 +384,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "dohee-sandbox",
  "serde",
  "serde_json",
  "tempfile",

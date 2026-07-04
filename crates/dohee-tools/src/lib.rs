@@ -370,7 +370,15 @@ impl Tool for GrepTool {
 }
 
 // 6. Run Shell Tool
-pub struct RunShellTool;
+pub struct RunShellTool {
+    pub policy: dohee_sandbox::SandboxPolicy,
+}
+
+impl RunShellTool {
+    pub fn new(policy: dohee_sandbox::SandboxPolicy) -> Self {
+        Self { policy }
+    }
+}
 
 #[async_trait]
 impl Tool for RunShellTool {
@@ -408,6 +416,21 @@ impl Tool for RunShellTool {
 
         if let Some(cwd) = cwd_str {
             cmd.current_dir(Path::new(cwd));
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+            let policy = self.policy.clone();
+            unsafe {
+                cmd.pre_exec(move || {
+                    if let Err(e) = dohee_sandbox::Sandbox::apply(&policy) {
+                        eprintln!("Landlock sandbox application failed: {:?}", e);
+                        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e));
+                    }
+                    Ok(())
+                });
+            }
         }
 
         let output = cmd.output().with_context(|| format!("Failed to spawn shell for command '{}'", command_str))?;
@@ -485,7 +508,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_shell() -> Result<()> {
-        let tool = RunShellTool;
+        let tool = RunShellTool::new(dohee_sandbox::SandboxPolicy::DangerFullAccess);
         let args = json!({
             "command": "echo 'Hello Shell'"
         });
