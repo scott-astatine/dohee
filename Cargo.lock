@@ -317,6 +317,8 @@ name = "dohee-infer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
+ "encoding_rs",
  "llama-cpp-2",
  "thiserror",
  "tokio",

@@ -38,7 +38,8 @@ tokio-util = { version = "0.7", features = ["codec", "io"] }
 toml = "0.8"
 
 # Subcrate specific dependencies
-llama-cpp-2 = "0.1.150"
+llama-cpp-2 = { version = "0.1.150", default-features = false }
 landlock = "0.4"
 rusqlite = { version = "0.31", features = ["bundled"] }
 ratatui = "0.26"
+encoding_rs = "0.8"
