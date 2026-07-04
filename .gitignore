@@ -1,0 +1,5 @@
+/target
+*.gguf
+.env
+*.log
+models/

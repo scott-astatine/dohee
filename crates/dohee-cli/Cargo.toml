@@ -1,0 +1,23 @@
+[package]
+name = "dohee-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# Local crates
+dohee-core = { path = "../dohee-core" }
+dohee-infer = { path = "../dohee-infer" }
+dohee-tools = { path = "../dohee-tools" }
+dohee-sandbox = { path = "../dohee-sandbox" }
+dohee-context = { path = "../dohee-context" }
+dohee-store = { path = "../dohee-store" }
+dohee-mcp = { path = "../dohee-mcp" }
+dohee-config = { path = "../dohee-config" }
+dohee-tui = { path = "../dohee-tui" }
+
+# Inherited dependencies
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
