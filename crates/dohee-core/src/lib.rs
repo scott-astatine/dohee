@@ -240,7 +240,7 @@ tool-call ::= list-dir | read-file | write-file | edit-file | run-shell
 list-dir ::= "<list_dir>" [^<]* "</list_dir>"
 read-file ::= "<read_file>" [^<]* "</read_file>"
 write-file ::= "<write_file path=\"" [^\"]* "\">" [^<]* "</write_file>"
-edit-file ::= "<edit_file path=\"" [^\"]* "\">" "<find>" [^<]* "</find>" "<replace>" [^\<]* "</replace>" "</edit_file>"
+edit-file ::= "<edit_file path=\"" [^\"]* "\">" "<find>" [^<]* "</find>" "<replace>" [^<]* "</replace>" "</edit_file>"
 run-shell ::= "<run_shell>" [^<]* "</run_shell>"
 "#;
                     do_infer::grammar_sampler(self.model, self.seed, self.temperature, grammar_str)
