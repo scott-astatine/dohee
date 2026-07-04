@@ -355,6 +355,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "landlock",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
