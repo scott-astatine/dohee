@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "dohee"
+path = "src/main.rs"
+
 [features]
 vulkan = ["dohee-infer/vulkan"]
 cuda = ["dohee-infer/cuda"]
