@@ -37,22 +37,36 @@ pub struct Agent<'a> {
 
 pub fn system_prompt(tools: &[Arc<dyn dohee_tools::Tool>]) -> String {
     let mut prompt = String::new();
-    prompt.push_str("You are Dohee (도회), an autonomous AI coding assistant. You run locally on the user's machine.\n");
-    prompt.push_str("You have access to the following tools:\n\n");
-    
+    prompt.push_str("You are Dohee (도회), an autonomous local AI coding assistant.\n");
+    prompt.push_str("You help the user develop, debug, and understand code in their workspace.\n");
+    prompt.push_str("You have access to the local filesystem and terminal. You execute actions by outputting special XML tags:\n\n");
+
+    prompt.push_str("1. List files in a directory:\n");
+    prompt.push_str("<list_dir>path</list_dir>\n\n");
+
+    prompt.push_str("2. Read file contents:\n");
+    prompt.push_str("<read_file>path</read_file>\n\n");
+
+    prompt.push_str("3. Write or overwrite a file:\n");
+    prompt.push_str("<write_file path=\"path\">\nfile content here\n</write_file>\n\n");
+
+    prompt.push_str("4. Edit an existing file using find and replace blocks:\n");
+    prompt.push_str("<edit_file path=\"path\"><find>exact block to find</find><replace>replacement content</replace></edit_file>\n\n");
+
+    prompt.push_str("5. Run a shell command in the workspace:\n");
+    prompt.push_str("<run_shell>command</run_shell>\n\n");
+
+    prompt.push_str("Available tools details:\n");
     for tool in tools {
         prompt.push_str(&format!("- **{}**: {}\n", tool.name(), tool.description()));
-        prompt.push_str(&format!("  Parameters schema: {}\n\n", serde_json::to_string(&tool.parameters_schema()).unwrap()));
+        prompt.push_str(&format!("  Parameters schema: {}\n", serde_json::to_string(&tool.parameters_schema()).unwrap()));
     }
     
-    prompt.push_str("To call a tool, you MUST use the following XML tags format:\n");
-    prompt.push_str("- To list a directory: <list_dir>path</list_dir>\n");
-    prompt.push_str("- To read a file: <read_file>path</read_file>\n");
-    prompt.push_str("- To write a file: <write_file path=\"path\">content</write_file>\n");
-    prompt.push_str("- To edit a file: <edit_file path=\"path\"><find>exact block to find</find><replace>replacement content</replace></edit_file>\n");
-    prompt.push_str("- To run a shell command: <run_shell>command</run_shell>\n\n");
-    
-    prompt.push_str("Make sure to always close your tool tags. Only perform one tool call at a time. After receiving the tool output, proceed with your analysis or call another tool if needed. When you are finished and have resolved the user's request, print your final response without calling any tools.\n");
+    prompt.push_str("\nRules for Tool Use:\n");
+    prompt.push_str("- Output only ONE tool invocation per turn when performing file edits or running commands, unless they are independent reads.\n");
+    prompt.push_str("- Always use paths relative to the current working directory.\n");
+    prompt.push_str("- Provide clear explanations before using tools, but let the tool block be the main actionable output.\n");
+    prompt.push_str("- Once you invoke a tool, STOP generating text. Dohee will execute the tool, capture the output, and present it to you in the next turn.\n");
     
     prompt
 }
