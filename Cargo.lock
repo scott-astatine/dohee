@@ -309,6 +309,8 @@ name = "dohee-context"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dohee-infer",
+ "llama-cpp-2",
  "serde",
  "thiserror",
  "tokio",
@@ -319,6 +321,7 @@ name = "dohee-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dohee-context",
  "dohee-infer",
  "dohee-sandbox",
  "dohee-tools",

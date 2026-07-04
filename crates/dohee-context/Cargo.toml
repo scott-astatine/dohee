@@ -9,4 +9,6 @@ authors.workspace = true
 serde = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+dohee-infer = { path = "../dohee-infer" }
+llama-cpp-2 = { workspace = true }
 tokio = { workspace = true }

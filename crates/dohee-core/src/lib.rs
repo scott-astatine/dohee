@@ -1,22 +1,9 @@
 use anyhow::{Context, Result};
 use regex::Regex;
-use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::sync::Arc;
 use dohee_infer as do_infer;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Message {
-    pub role: String, // "system", "user", "assistant", "tool"
-    pub content: String,
-    pub name: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Session {
-    pub messages: Vec<Message>,
-    pub created_at: u64,
-}
+pub use dohee_context::{Message, Session};
 
 #[derive(Debug, Clone)]
 pub struct ParsedToolCall {
