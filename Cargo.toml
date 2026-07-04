@@ -43,3 +43,4 @@ landlock = "0.4"
 rusqlite = { version = "0.31", features = ["bundled"] }
 ratatui = "0.26"
 encoding_rs = "0.8"
+tempfile = "3.10"
