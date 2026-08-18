@@ -17,3 +17,4 @@ dohee-sandbox = { path = "../dohee-sandbox" }
 regex = { workspace = true }
 llama-cpp-2 = { workspace = true }
 dohee-context = { path = "../dohee-context" }
+dohee-prompt = { path = "../dohee-prompt" }

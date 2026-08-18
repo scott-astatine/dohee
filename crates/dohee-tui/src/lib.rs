@@ -1,423 +1,339 @@
+//! # `dohee-tui`
+//!
+//! A borderless, true-color Terminal User Interface (TUI) for the Dohee local-first AI coding agent.
+//! Inspired by `codex-cli`, it implements a Component-based Model-View-Update (MVU) architecture.
+//!
+//! ## Architecture Overview
+//!
+//! The subcrate is structured into several modular layers:
+//! - [`terminal`]: RAII-safe raw mode and screen buffer initialization (`TerminalGuard`).
+//! - [`action`]: Centralized `Action` enum that models user inputs and background agent events.
+//! - [`app`]: The core `TuiApp` state coordinator acting as the Model and the Action transition loop.
+//! - [`theme`]: Catppuccin Mocha-themed true-color constants and paragraph styling templates.
+//! - [`worker`]: Asynchronous background runner wrapper coordinating database lookups and blocking llama.cpp turns.
+//! - [`components`]: Visual widget sections (Header, Transcript, Composer, StatusBar, Popups) implementing the common `Component` trait.
+
 use anyhow::{Context, Result};
-use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
+use crossterm::event::{self, Event};
 use dohee_context::Message;
-use dohee_core::{Agent, AgentEvent};
-use dohee_core as do_core;
-use dohee_sandbox::SandboxPolicy;
-use dohee_tools::ToolRegistry;
-use llama_cpp_2::llama_backend::LlamaBackend;
 use ratatui::{
-    backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
-    Frame, Terminal,
 };
-use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub struct TuiApp {
-    pub messages: Vec<Message>,
-    pub status: String,
-    pub pending_approval: Option<(String, serde_json::Value, tokio::sync::oneshot::Sender<bool>)>,
-    pub list_state: ListState,
-    pub input_buf: String,
-    pub input_mode: bool, // true: typing prompt, false: viewing/finished
-    pub sandbox_desc: String,
-    pub tokens_used: usize,
-    pub tokens_limit: usize,
-    pub finished: bool,
-}
+pub mod action;
+pub mod app;
+pub mod components;
+pub mod terminal;
+pub mod theme;
+pub mod worker;
 
-impl TuiApp {
-    pub fn new(sandbox_desc: String, tokens_limit: usize) -> Self {
-        Self {
-            messages: Vec::new(),
-            status: "Initializing...".to_string(),
-            pending_approval: None,
-            list_state: ListState::default(),
-            input_buf: String::new(),
-            input_mode: true,
-            sandbox_desc,
-            tokens_used: 0,
-            tokens_limit,
-            finished: false,
-        }
-    }
+pub use app::{AgentMode, InputMode, TuiApp, TuiCommand};
+use action::Action;
+use components::Component;
 
-    pub fn add_token(&mut self, piece: &str) {
-        if let Some(last_msg) = self.messages.last_mut() {
-            if last_msg.role == "assistant" {
-                last_msg.content.push_str(piece);
-                return;
-            }
-        }
-        // If last message is not assistant, create a new one
-        self.messages.push(Message {
-            role: "assistant".to_string(),
-            content: piece.to_string(),
-            name: None,
-        });
-        self.scroll_to_bottom();
-    }
-
-    pub fn add_message(&mut self, msg: Message) {
-        self.messages.push(msg);
-        self.scroll_to_bottom();
-    }
-
-    pub fn scroll_to_bottom(&mut self) {
-        if !self.messages.is_empty() {
-            self.list_state.select(Some(self.messages.len() - 1));
-        }
-    }
+#[derive(Debug, Clone)]
+pub enum TuiEvent {
+    Key(crossterm::event::KeyEvent),
+    Resize(u16, u16),
 }
 
 pub async fn run_tui(
     config: dohee_config::DoheeConfig,
     initial_prompt: Option<String>,
 ) -> Result<()> {
-    // 1. Setup terminal
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    // 1. Initialize RAII Terminal Guard
+    let mut guard = terminal::TerminalGuard::new()?;
 
-    // 2. Setup channels
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    // 2. Load LLM Backend singleton
+    let backend_tup = dohee_infer::backend().context("Failed to get backend")?;
+    let gpu_layers = if config.backend == "cpu" { 0 } else { config.gpu_layers };
+    let model_path = config.model_path.clone().unwrap_or_else(|| std::path::PathBuf::from("models/Gemma-4e3bu-ag.gguf"));
+    let model = dohee_infer::DoheeModel::new(backend_tup, &model_path, gpu_layers)
+        .context("Failed to load model")?;
+        
+    let model_ref: &'static dohee_infer::DoheeModel = Box::leak(Box::new(model));
+    let backend_ref = backend_tup; // &'static LlamaBackend
 
-    // 3. Initialize state
+    // 3. Register standard agent tools
+    let mut registry = dohee_tools::ToolRegistry::new();
+    let sandbox_policy = match config.sandbox_policy.as_str() {
+        "ReadOnly" => dohee_sandbox::SandboxPolicy::ReadOnly,
+        "DangerFullAccess" => dohee_sandbox::SandboxPolicy::DangerFullAccess,
+        _ => dohee_sandbox::SandboxPolicy::WorkspaceWrite {
+            root: std::env::current_dir().unwrap_or_default(),
+        },
+    };
+    registry.register(std::sync::Arc::new(dohee_tools::ReadFileTool));
+    registry.register(std::sync::Arc::new(dohee_tools::WriteFileTool));
+    registry.register(std::sync::Arc::new(dohee_tools::EditFileTool));
+    registry.register(std::sync::Arc::new(dohee_tools::ListDirTool));
+    registry.register(std::sync::Arc::new(dohee_tools::GrepTool));
+    registry.register(std::sync::Arc::new(dohee_tools::RunShellTool::new(sandbox_policy.clone())));
+    registry.register(std::sync::Arc::new(dohee_tools::ListSymbolsTool));
+    registry.register(std::sync::Arc::new(dohee_tools::FindDefinitionTool));
+
+    // 4. Start Background Worker
+    let model_name = config
+        .model_path
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "qwen2.5".to_string());
     let sandbox_desc = config.sandbox_policy.clone();
     let limit = config.ctx_size as usize;
-    let app_state = Arc::new(tokio::sync::Mutex::new(TuiApp::new(sandbox_desc, limit)));
+    
+    let mut worker = worker::AgentWorker::spawn(config, registry, model_ref, backend_ref)
+        .context("Failed to spawn background agent worker")?;
+    let app_state = Arc::new(tokio::sync::Mutex::new(TuiApp::new(model_name, sandbox_desc, limit)));
 
-    // Set up model parameters clone for background thread
-    let config_clone = config.clone();
-    let app_state_clone = app_state.clone();
-
-    // 4. Spawn background agent thread
-    tokio::spawn(async move {
-        let res = async {
-            let model_path = config_clone.model_path.as_ref().context("Model path not specified")?;
-            let backend = LlamaBackend::init().context("Failed to initialize backend")?;
-            
-            let gpu_layers = if config_clone.backend == "cpu" { 0 } else { config_clone.gpu_layers };
-            let model = dohee_infer::DoheeModel::new(&backend, model_path, gpu_layers)?;
-
-            let sandbox_policy = match config_clone.sandbox_policy.as_str() {
-                "ReadOnly" => SandboxPolicy::ReadOnly,
-                "DangerFullAccess" => SandboxPolicy::DangerFullAccess,
-                _ => SandboxPolicy::WorkspaceWrite {
-                    root: std::env::current_dir().unwrap_or_default(),
-                },
-            };
-
-            let mut registry = ToolRegistry::new();
-            registry.register(Arc::new(dohee_tools::ReadFileTool));
-            registry.register(Arc::new(dohee_tools::WriteFileTool));
-            registry.register(Arc::new(dohee_tools::EditFileTool));
-            registry.register(Arc::new(dohee_tools::ListDirTool));
-            registry.register(Arc::new(dohee_tools::GrepTool));
-            registry.register(Arc::new(dohee_tools::RunShellTool::new(sandbox_policy.clone())));
-
-            let sys_prompt = do_core::system_prompt(&registry.list());
-            let mut messages = vec![Message {
-                role: "system".to_string(),
-                content: sys_prompt,
-                name: None,
-            }];
-
-            if let Some(prompt) = initial_prompt {
-                messages.push(Message {
-                    role: "user".to_string(),
-                    content: prompt,
-                    name: None,
-                });
-            }
-
-            // Sync initial messages back to TUI
-            {
-                let mut app = app_state_clone.lock().await;
-                for msg in &messages {
-                    app.add_message(msg.clone());
-                }
-            }
-
-            let mut agent = Agent::new(&model, &backend, registry, sandbox_policy);
-            agent.temperature = config_clone.temperature;
-            agent.seed = config_clone.seed;
-            agent.event_tx = Some(event_tx.clone());
-
-            agent.run_turn_loop(&mut messages, config_clone.ctx_size, config_clone.threads).await?;
-
-            if let Some(ref tx) = agent.event_tx {
-                let _ = tx.send(AgentEvent::Finished);
-            }
-            Ok::<(), anyhow::Error>(())
-        }.await;
-
-        if let Err(e) = res {
-            let mut app = app_state_clone.lock().await;
-            app.status = format!("Fatal: {:?}", e);
-            app.finished = true;
-        }
-    });
-
-    // 5. Main TUI render/event loop
-    let mut last_tick = std::time::Instant::now();
-    let tick_rate = Duration::from_millis(50);
-
-    loop {
-        // Draw frame
-        {
-            let mut app = app_state.lock().await;
-            terminal.draw(|f| render_ui(f, &mut app))?;
-        }
-
-        // Handle agent events
-        while let Ok(event) = event_rx.try_recv() {
-            let mut app = app_state.lock().await;
-            match event {
-                AgentEvent::Token(piece) => {
-                    app.add_token(&piece);
-                }
-                AgentEvent::Status(status) => {
-                    app.status = status;
-                }
-                AgentEvent::ToolRequest { name, args, approve_tx } => {
-                    app.status = format!("Pending approval for: {}", name);
-                    app.pending_approval = Some((name, args, approve_tx));
-                }
-                AgentEvent::Finished => {
-                    app.status = "Finished task.".to_string();
-                    app.finished = true;
-                    app.input_mode = false;
-                }
-            }
-        }
-
-        // Handle user input
-        let timeout = tick_rate
-            .checked_sub(last_tick.elapsed())
-            .unwrap_or_else(|| Duration::from_secs(0));
-
-        if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                let mut app = app_state.lock().await;
-
-                // 1. Tool approval mode
-                if let Some((_name, _args, tx)) = app.pending_approval.take() {
-                    match key.code {
-                        KeyCode::Char('y') | KeyCode::Char('Y') => {
-                            let _ = tx.send(true);
-                            app.status = "Approved execution.".to_string();
-                        }
-                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                            let _ = tx.send(false);
-                            app.status = "Execution denied.".to_string();
-                        }
-                        _ => {
-                            // Put it back if any other key was pressed
-                            app.pending_approval = Some((_name, _args, tx));
+    // 5. Spawn keyboard/resize event reader thread
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
+    std::thread::spawn(move || {
+        loop {
+            if let Ok(true) = event::poll(Duration::from_millis(50)) {
+                match event::read() {
+                    Ok(Event::Key(key)) => {
+                        if event_tx.send(TuiEvent::Key(key)).is_err() {
+                            break;
                         }
                     }
-                    continue;
-                }
-
-                // 2. Normal navigation/input mode
-                match key.code {
-                    KeyCode::Esc => {
-                        // Exit TUI
-                        break;
-                    }
-                    KeyCode::Up => {
-                        if !app.messages.is_empty() {
-                            let curr = app.list_state.selected().unwrap_or(0);
-                            if curr > 0 {
-                                app.list_state.select(Some(curr - 1));
-                            }
-                        }
-                    }
-                    KeyCode::Down => {
-                        if !app.messages.is_empty() {
-                            let curr = app.list_state.selected().unwrap_or(0);
-                            if curr < app.messages.len() - 1 {
-                                app.list_state.select(Some(curr + 1));
-                            }
+                    Ok(Event::Resize(w, h)) => {
+                        if event_tx.send(TuiEvent::Resize(w, h)).is_err() {
+                            break;
                         }
                     }
                     _ => {}
                 }
             }
         }
+    });
 
-        if last_tick.elapsed() >= tick_rate {
-            last_tick = std::time::Instant::now();
-        }
+    // 6. Initialize UI Components
+    let mut header_comp = components::header::HeaderComponent::new();
+    let mut transcript_comp = components::transcript::TranscriptComponent::new();
+    let mut composer_comp = components::composer::ComposerComponent::new();
+    let mut status_bar_comp = components::status_bar::StatusBarComponent::new();
+    let mut popups_comp = components::popups::PopupsComponent::new();
+
+    // 7. Handle initial prompt if supplied
+    if let Some(prompt) = initial_prompt {
+        let mut app = app_state.lock().await;
+        app.add_message(Message {
+            role: "user".to_string(),
+            content: prompt.clone(),
+            name: None,
+        });
+        app.status = "Agent running...".to_string();
+        let messages_copy = app.messages.clone();
+        let _ = worker.ui_cmd_tx.send(TuiCommand::SubmitPrompt {
+            prompt,
+            messages: messages_copy,
+        });
     }
 
-    // Restore terminal
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    let mut current_tool_approve_tx: Option<tokio::sync::oneshot::Sender<bool>> = None;
+
+    // 8. Main Event Pump
+    loop {
+        {
+            let mut app = app_state.lock().await;
+            guard.terminal.draw(|f| {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .margin(0)
+                    .constraints([
+                        Constraint::Length(3),
+                        Constraint::Min(8),
+                        Constraint::Length(3),
+                        Constraint::Length(1),
+                    ])
+                    .split(f.size());
+
+                let _ = header_comp.draw(f, chunks[0], &mut app);
+                let _ = transcript_comp.draw(f, chunks[1], &mut app);
+                let _ = composer_comp.draw(f, chunks[2], &mut app);
+                let _ = status_bar_comp.draw(f, chunks[3], &mut app);
+                let _ = popups_comp.draw(f, f.size(), &mut app);
+            })?;
+
+            if app.finished {
+                break;
+            }
+        }
+
+        tokio::select! {
+            Some(tui_event) = event_rx.recv() => {
+                match tui_event {
+                    TuiEvent::Key(key) => {
+                        let mut app = app_state.lock().await;
+
+                        // Pass key events down to components depending on mode
+                        let mut action = None;
+                        if app.input_mode == InputMode::CommandPalette {
+                            action = popups_comp.handle_key_event(key, &mut app)?;
+                        }
+                        if action.is_none() {
+                            action = composer_comp.handle_key_event(key, &mut app)?;
+                        }
+                        if action.is_none() {
+                            action = transcript_comp.handle_key_event(key, &mut app)?;
+                        }
+
+                        if let Some(act) = action {
+                            dispatch_action(act, &mut app, &mut worker, &mut current_tool_approve_tx).await?;
+                        }
+                    }
+                    TuiEvent::Resize(_w, _h) => {
+                        // Automatically updates layout on next loop draw
+                    }
+                }
+            }
+            Some(agent_event) = worker.agent_rx.recv() => {
+                let mut app = app_state.lock().await;
+                match agent_event {
+                    dohee_core::AgentEvent::Token(tok) => {
+                        app.add_token(&tok);
+                    }
+                    dohee_core::AgentEvent::Status(stat) => {
+                        app.status = stat;
+                    }
+                    dohee_core::AgentEvent::ToolRequest { name, args, approve_tx } => {
+                        app.status = format!("Approval requested for tool '{}'", name);
+                        app.input_mode = InputMode::Approval;
+                        current_tool_approve_tx = Some(approve_tx);
+                        app.pending_approval = Some((name, args, tokio::sync::oneshot::channel::<bool>().0));
+                    }
+                    dohee_core::AgentEvent::ToolResult { name, output } => {
+                        app.status = format!("Tool '{}' finished execution.", name);
+                        app.add_message(Message {
+                            role: "tool".to_string(),
+                            content: format!("Tool output:\n{}", output),
+                            name: Some(name),
+                        });
+                    }
+                    dohee_core::AgentEvent::Finished => {
+                        app.status = "Ready".to_string();
+                        app.input_mode = InputMode::Normal;
+                    }
+                }
+            }
+        }
+    }
 
     Ok(())
 }
 
-fn render_ui(f: &mut Frame, app: &mut TuiApp) {
-    // Layout split: Header, Main (Left Conversation, Right Stats), Footer
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Header
-            Constraint::Min(5),    // Main
-            Constraint::Length(3), // Footer
-        ])
-        .split(f.size());
-
-    // 1. Header widget
-    let header_block = Block::default()
-        .borders(Borders::ALL)
-        .style(Style::default().fg(Color::Cyan));
-    let header_text = format!(
-        " DOHEE (도회) v0.1.0  |  Status: {} ",
-        app.status
-    );
-    let header = Paragraph::new(header_text)
-        .block(header_block)
-        .style(Style::default().add_modifier(Modifier::BOLD));
-    f.render_widget(header, chunks[0]);
-
-    // Main split: Left Conversation, Right Stats
-    let main_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(70), // Conversation
-            Constraint::Percentage(30), // Sidebar
-        ])
-        .split(chunks[1]);
-
-    // 2. Left Conversation Logger
-    let list_items: Vec<ListItem> = app
-        .messages
-        .iter()
-        .map(|msg| {
-            let role_span = match msg.role.as_str() {
-                "system" => Span::styled("[System]", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
-                "user" => Span::styled("[User]", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
-                "assistant" => Span::styled("[Assistant]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                "tool" => Span::styled(
-                    format!("[Tool: {}]", msg.name.as_deref().unwrap_or("unknown")),
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                ),
-                _ => Span::styled(format!("[{}]", msg.role), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-            };
-
-            let mut lines = vec![Line::from(vec![role_span])];
-            for l in msg.content.lines() {
-                lines.push(Line::from(vec![Span::raw(l)]));
+async fn dispatch_action(
+    action: Action,
+    app: &mut TuiApp,
+    worker: &mut worker::AgentWorker,
+    current_tool_approve_tx: &mut Option<tokio::sync::oneshot::Sender<bool>>,
+) -> Result<()> {
+    match action {
+        Action::SubmitPrompt(prompt) => {
+            if prompt.starts_with('/') {
+                app.handle_slash_command(&prompt, &worker.ui_cmd_tx).await?;
+            } else {
+                app.add_message(Message {
+                    role: "user".to_string(),
+                    content: prompt.clone(),
+                    name: None,
+                });
+                app.status = "Agent running...".to_string();
+                app.input_mode = InputMode::Normal;
+                let messages_copy = app.messages.clone();
+                let _ = worker.ui_cmd_tx.send(TuiCommand::SubmitPrompt {
+                    prompt,
+                    messages: messages_copy,
+                });
             }
-            // Empty space between messages
-            lines.push(Line::from(""));
-
-            ListItem::new(lines)
-        })
-        .collect();
-
-    let list_block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Conversation History ");
-    let list = List::new(list_items)
-        .block(list_block)
-        .highlight_style(
-            Style::default()
-                .bg(Color::Rgb(40, 40, 40))
-                .add_modifier(Modifier::ITALIC),
-        );
-    f.render_stateful_widget(list, main_chunks[0], &mut app.list_state);
-
-    // 3. Right Sidebar (Stats & Sandbox Details)
-    let sidebar_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(8), // Token Usage
-            Constraint::Min(4),    // Sandbox Details
-        ])
-        .split(main_chunks[1]);
-
-    // Sidebar: Token Usage
-    let token_block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Context Usage ");
-    let token_text = vec![
-        Line::from(vec![
-            Span::styled("Tokenizer: ", Style::default().fg(Color::DarkGray)),
-            Span::raw("llama.cpp built-in"),
-        ]),
-        Line::from(vec![
-            Span::styled("Tokens Limit: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!("{}", app.tokens_limit)),
-        ]),
-        Line::from(vec![
-            Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Prefix caching enabled", Style::default().fg(Color::Green)),
-        ]),
-    ];
-    let token_para = Paragraph::new(token_text).block(token_block);
-    f.render_widget(token_para, sidebar_chunks[0]);
-
-    // Sidebar: Sandbox details
-    let sandbox_block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Sandbox Status ");
-    let sandbox_text = vec![
-        Line::from(vec![
-            Span::styled("Policy: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{}", app.sandbox_desc), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Kernel LSM: ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Landlock V1 (Enforced)", Style::default().fg(Color::Green)),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled("Process tree writes isolated to workspace root folder.", Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC))),
-    ];
-    let sandbox_para = Paragraph::new(sandbox_text).block(sandbox_block).wrap(Wrap { trim: true });
-    f.render_widget(sandbox_para, sidebar_chunks[1]);
-
-    // 4. Footer (Input Box or Tool Approval Prompt)
-    let footer_block = Block::default().borders(Borders::ALL);
-    if let Some((ref name, ref args, _)) = app.pending_approval {
-        let prompt_text = format!(
-            " ⚠️  APPROVAL REQUIRED: Execute tool '{}' with args '{}'?  (y)es / (n)o ",
-            name,
-            serde_json::to_string(args).unwrap_or_default()
-        );
-        let footer = Paragraph::new(prompt_text)
-            .block(footer_block.title(" Tool Approval ").style(Style::default().fg(Color::LightRed)))
-            .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
-        f.render_widget(footer, chunks[2]);
-    } else if app.finished {
-        let footer = Paragraph::new(" Task completed. Press [Esc] to exit. Use Up/Down arrows to scroll conversation history. ")
-            .block(footer_block.title(" Session Complete ").style(Style::default().fg(Color::Green)))
-            .style(Style::default().fg(Color::Green));
-        f.render_widget(footer, chunks[2]);
-    } else {
-        let footer = Paragraph::new(" Agent loop is running... View streamed outputs in the panel above. Use Up/Down to scroll. ")
-            .block(footer_block.title(" Interactive Shell ").style(Style::default().fg(Color::DarkGray)))
-            .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC));
-        f.render_widget(footer, chunks[2]);
+        }
+        Action::ApproveTool(approved) => {
+            if let Some(tx) = current_tool_approve_tx.take() {
+                let _ = tx.send(approved);
+            }
+            app.status = if approved { "Approved tool execution".to_string() } else { "Denied tool execution".to_string() };
+            app.input_mode = InputMode::Normal;
+            app.pending_approval = None;
+        }
+        Action::UpdateConfig { temp, seed, ctx_size, sandbox_policy } => {
+            let _ = worker.ui_cmd_tx.send(TuiCommand::UpdateConfig {
+                temp,
+                seed,
+                ctx_size,
+                sandbox_policy,
+            });
+        }
+        Action::ScrollUp => {
+            if app.input_mode == InputMode::Visual {
+                if let Some(curr) = app.visual_end {
+                    if curr > 0 {
+                        app.visual_end = Some(curr - 1);
+                        app.list_state.select(Some(curr - 1));
+                    }
+                }
+            } else if !app.messages.is_empty() {
+                let curr = app.list_state.selected().unwrap_or(0);
+                if curr > 0 {
+                    app.list_state.select(Some(curr - 1));
+                }
+            }
+        }
+        Action::ScrollDown => {
+            if app.input_mode == InputMode::Visual {
+                if let Some(curr) = app.visual_end {
+                    if curr < app.messages.len() - 1 {
+                        app.visual_end = Some(curr + 1);
+                        app.list_state.select(Some(curr + 1));
+                    }
+                }
+            } else if !app.messages.is_empty() {
+                let curr = app.list_state.selected().unwrap_or(0);
+                if curr < app.messages.len() - 1 {
+                    app.list_state.select(Some(curr + 1));
+                }
+            }
+        }
+        Action::ScrollToTop => {
+            if !app.messages.is_empty() {
+                app.list_state.select(Some(0));
+            }
+        }
+        Action::ScrollToBottom => {
+            app.scroll_to_bottom();
+        }
+        Action::YankSelection => {
+            app.yank_visual_selection()?;
+        }
+        Action::CycleAutocomplete => {
+            app.cycle_autocomplete();
+        }
+        Action::ResetAutocomplete => {
+            app.reset_autocomplete();
+        }
+        Action::ToggleCommandPalette => {
+            app.input_mode = InputMode::CommandPalette;
+        }
+        Action::SetAgentMode(mode) => {
+            app.agent_mode = mode;
+            app.input_mode = InputMode::Normal;
+        }
+        Action::SetInputMode(mode) => {
+            app.input_mode = mode;
+            if mode == InputMode::Visual {
+                let sel = app.list_state.selected().unwrap_or(0);
+                app.visual_start = Some(sel);
+                app.visual_end = Some(sel);
+            } else {
+                app.visual_start = None;
+                app.visual_end = None;
+            }
+        }
+        Action::Exit => {
+            app.finished = true;
+        }
+        _ => {}
     }
+    Ok(())
 }

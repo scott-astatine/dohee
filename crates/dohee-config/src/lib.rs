@@ -15,6 +15,7 @@ pub struct PartialConfig {
     pub sandbox_policy: Option<String>,
     pub allowed_tools: Option<Vec<String>>,
     pub denied_tools: Option<Vec<String>>,
+    pub chat_template: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -29,6 +30,7 @@ pub struct DoheeConfig {
     pub sandbox_policy: String,
     pub allowed_tools: Option<Vec<String>>,
     pub denied_tools: Option<Vec<String>>,
+    pub chat_template: Option<String>,
 }
 
 impl Default for DoheeConfig {
@@ -36,7 +38,7 @@ impl Default for DoheeConfig {
         Self {
             model_path: None,
             backend: "vulkan".to_string(),
-            ctx_size: 2048,
+            ctx_size: 8192,
             temperature: 0.2,
             seed: 1234,
             gpu_layers: 99,
@@ -44,6 +46,7 @@ impl Default for DoheeConfig {
             sandbox_policy: "WorkspaceWrite".to_string(),
             allowed_tools: None,
             denied_tools: None,
+            chat_template: None,
         }
     }
 }
@@ -79,6 +82,9 @@ impl DoheeConfig {
         }
         if other.denied_tools.is_some() {
             self.denied_tools = other.denied_tools;
+        }
+        if let Some(ct) = other.chat_template {
+            self.chat_template = Some(ct);
         }
     }
 

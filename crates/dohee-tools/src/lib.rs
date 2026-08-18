@@ -7,6 +7,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolOutput {
@@ -42,8 +43,16 @@ pub trait Tool: Send + Sync {
     async fn execute(&self, args: Value) -> Result<ToolOutput>;
 }
 
+#[derive(Clone)]
 pub struct ToolRegistry {
-    tools: HashMap<String, Arc<dyn Tool>>,
+    tools: std::collections::HashMap<String, Arc<dyn Tool>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentMode {
+    Build,
+    Plan,
+    Explore,
 }
 
 impl ToolRegistry {
@@ -63,6 +72,28 @@ impl ToolRegistry {
 
     pub fn list(&self) -> Vec<Arc<dyn Tool>> {
         self.tools.values().cloned().collect()
+    }
+
+    pub fn for_mode(&self, mode: AgentMode) -> Self {
+        let mut filtered = Self::new();
+        for (name, tool) in &self.tools {
+            match mode {
+                AgentMode::Build => {
+                    filtered.register(Arc::clone(tool));
+                }
+                AgentMode::Plan => {
+                    if name != "write_file" && name != "edit_file" && name != "run_shell" {
+                        filtered.register(Arc::clone(tool));
+                    }
+                }
+                AgentMode::Explore => {
+                    if name == "read_file" || name == "list_dir" || name == "grep" || name == "find_definition" || name == "list_symbols" {
+                        filtered.register(Arc::clone(tool));
+                    }
+                }
+            }
+        }
+        filtered
     }
 }
 
@@ -295,7 +326,7 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &'static str {
-        "Searches files recursively in a directory for a specific text pattern."
+        "Searches files recursively in a directory for a specific text pattern with glob filtering."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -309,6 +340,14 @@ impl Tool for GrepTool {
                 "path": {
                     "type": "string",
                     "description": "The directory to search. Defaults to '.' if empty."
+                },
+                "include_glob": {
+                    "type": "string",
+                    "description": "Optional glob pattern to include matching files (e.g. '*.rs')."
+                },
+                "exclude_glob": {
+                    "type": "string",
+                    "description": "Optional glob pattern to exclude matching files (e.g. '*test*')."
                 }
             },
             "required": ["pattern"]
@@ -324,42 +363,57 @@ impl Tool for GrepTool {
             return Ok(ToolOutput::new(format!("Error: Path '{}' does not exist.", path_str)));
         }
 
+        let include_matcher = if let Some(g) = args["include_glob"].as_str() {
+            globset::Glob::new(g).ok().map(|glob| glob.compile_matcher())
+        } else {
+            None
+        };
+
+        let exclude_matcher = if let Some(g) = args["exclude_glob"].as_str() {
+            globset::Glob::new(g).ok().map(|glob| glob.compile_matcher())
+        } else {
+            None
+        };
+
         let mut results = String::new();
         let mut match_count = 0;
+        let max_matches = 100;
 
-        fn walk(pattern: &str, dir: &Path, results: &mut String, match_count: &mut usize) -> Result<()> {
-            if *match_count > 100 {
-                return Ok(());
-            }
-            if dir.is_dir() {
-                for entry in fs::read_dir(dir)? {
-                    let entry = entry?;
-                    let entry_path = entry.path();
-                    let name = entry_path.file_name().unwrap_or_default().to_string_lossy();
-                    // Skip binary/large directories
-                    if name == "target" || name == ".git" || name == "node_modules" {
+        for entry in ignore::WalkBuilder::new(path).hidden(false).parents(true).build() {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let entry_path = entry.path();
+            if entry_path.is_file() {
+                if let Some(ref inc) = include_matcher {
+                    if !inc.is_match(entry_path) {
                         continue;
                     }
-                    walk(pattern, &entry_path, results, match_count)?;
                 }
-            } else if dir.is_file() {
-                if let Ok(content) = fs::read_to_string(dir) {
+                if let Some(ref exc) = exclude_matcher {
+                    if exc.is_match(entry_path) {
+                        continue;
+                    }
+                }
+
+                if let Ok(content) = fs::read_to_string(entry_path) {
                     for (line_num, line) in content.lines().enumerate() {
                         if line.contains(pattern) {
-                            results.push_str(&format!("{}:{}: {}\n", dir.display(), line_num + 1, line));
-                            *match_count += 1;
-                            if *match_count > 100 {
-                                results.push_str("... [Too many matches, truncating]\n");
+                            results.push_str(&format!("{}:{}: {}\n", entry_path.display(), line_num + 1, line));
+                            match_count += 1;
+                            if match_count >= max_matches {
+                                results.push_str(&format!("\n... [{} matches reached, remaining matches not shown. Narrow your search with a glob filter]\n", max_matches));
                                 break;
                             }
                         }
                     }
                 }
             }
-            Ok(())
+            if match_count >= max_matches {
+                break;
+            }
         }
-
-        walk(pattern, path, &mut results, &mut match_count)?;
 
         if results.is_empty() {
             Ok(ToolOutput::new("No matches found.".to_string()))
@@ -457,6 +511,255 @@ impl Tool for RunShellTool {
     }
 }
 
+// 7. Find Definition Tool (AST via tree-sitter)
+pub struct FindDefinitionTool;
+
+#[async_trait]
+impl Tool for FindDefinitionTool {
+    fn name(&self) -> &'static str {
+        "find_definition"
+    }
+
+    fn description(&self) -> &'static str {
+        "Locates the AST definition of a symbol (struct, function, trait, enum) across source files."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "symbol": {
+                    "type": "string",
+                    "description": "The exact identifier or symbol name to find."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Directory or file to search. Defaults to '.' if empty."
+                }
+            },
+            "required": ["symbol"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<ToolOutput> {
+        let symbol = args["symbol"].as_str().context("Missing or invalid 'symbol' argument")?;
+        let path_str = args["path"].as_str().unwrap_or(".");
+        let path = Path::new(path_str);
+
+        let mut parser = tree_sitter::Parser::new();
+        let language = tree_sitter_rust::language();
+        parser.set_language(&language).context("Error loading Rust grammar")?;
+
+        let mut results = String::new();
+        let mut count = 0;
+
+        for entry in ignore::WalkBuilder::new(path).hidden(false).parents(false).build() {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let entry_path = entry.path();
+            if entry_path.is_file() && entry_path.extension().map_or(false, |ext| ext == "rs") {
+                if let Ok(source) = fs::read_to_string(entry_path) {
+                    if let Some(tree) = parser.parse(&source, None) {
+                        let root = tree.root_node();
+                        fn walk_def(node: tree_sitter::Node, source: &str, symbol: &str, entry_path: &Path, results: &mut String, count: &mut usize) {
+                            let kind = node.kind();
+                            if kind == "struct_item" || kind == "function_item" || kind == "fn_item" || kind == "enum_item" || kind == "trait_item" {
+                                if let Some(name_node) = node.child_by_field_name("name") {
+                                    let name = &source[name_node.start_byte()..name_node.end_byte()];
+                                    if name == symbol {
+                                        let range = node.range();
+                                        results.push_str(&format!(
+                                            "{}:{}:{}: Definition of '{}'\n",
+                                            entry_path.display(),
+                                            range.start_point.row + 1,
+                                            range.start_point.column + 1,
+                                            symbol
+                                        ));
+                                        *count += 1;
+                                    }
+                                }
+                            }
+                            let mut cursor = node.walk();
+                            for child in node.children(&mut cursor) {
+                                walk_def(child, source, symbol, entry_path, results, count);
+                            }
+                        }
+                        walk_def(root, &source, symbol, entry_path, &mut results, &mut count);
+                    }
+                }
+            }
+        }
+
+        if count == 0 {
+            Ok(ToolOutput::new(format!("No AST definition found for symbol '{}'.", symbol)))
+        } else {
+            Ok(ToolOutput::new(results))
+        }
+    }
+}
+
+// 8. List Symbols Tool (AST via tree-sitter)
+pub struct ListSymbolsTool;
+
+#[async_trait]
+impl Tool for ListSymbolsTool {
+    fn name(&self) -> &'static str {
+        "list_symbols"
+    }
+
+    fn description(&self) -> &'static str {
+        "Lists top-level functions, structs, enums, and traits in a source file using AST parsing."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the source file to list symbols from."
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<ToolOutput> {
+        let path_str = args["path"].as_str().context("Missing or invalid 'path' argument")?;
+        let path = Path::new(path_str);
+
+        if !path.exists() {
+            return Ok(ToolOutput::new(format!("Error: File '{}' does not exist.", path_str)));
+        }
+
+        let source = fs::read_to_string(path)?;
+        let mut parser = tree_sitter::Parser::new();
+        let language = tree_sitter_rust::language();
+        parser.set_language(&language).context("Error loading Rust grammar")?;
+
+        let tree = parser.parse(&source, None).context("Failed to parse file AST")?;
+        let root = tree.root_node();
+
+        let mut output = String::new();
+        output.push_str(&format!("AST Symbols in '{}':\n", path_str));
+
+        let mut cursor = root.walk();
+        for child in root.children(&mut cursor) {
+            let kind = child.kind();
+            if kind == "struct_item" || kind == "function_item" || kind == "fn_item" || kind == "enum_item" || kind == "trait_item" || kind == "impl_item" {
+                let range = child.range();
+                let snippet = source[child.start_byte()..child.end_byte()].lines().next().unwrap_or("");
+                output.push_str(&format!("  Line {}: {}\n", range.start_point.row + 1, snippet));
+            }
+        }
+
+        Ok(ToolOutput::new(output))
+    }
+}
+
+// 9. Web Search Tool
+pub struct WebSearchTool;
+
+#[async_trait]
+impl Tool for WebSearchTool {
+    fn name(&self) -> &'static str {
+        "web_search"
+    }
+
+    fn description(&self) -> &'static str {
+        "Performs a web search using a metasearch engine (SearXNG / DuckDuckGo API)."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query string."
+                }
+            },
+            "required": ["query"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<ToolOutput> {
+        let query = args["query"].as_str().context("Missing or invalid 'query' argument")?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+
+        let url = format!("https://html.duckduckgo.com/html/?q={}", urlencoding::encode(query));
+        let res = client.get(&url).header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64)").send().await;
+
+        match res {
+            Ok(resp) => {
+                let body = resp.text().await.unwrap_or_default();
+                let markdown = html2md::parse_html(&body);
+                let limit = 4000;
+                if markdown.len() > limit {
+                    Ok(ToolOutput::new_truncated(markdown[..limit].to_string(), markdown.len()))
+                } else {
+                    Ok(ToolOutput::new(markdown))
+                }
+            }
+            Err(e) => Ok(ToolOutput::new(format!("Web search error: {}", e))),
+        }
+    }
+}
+
+// 10. Web Fetch Tool
+pub struct WebFetchTool;
+
+#[async_trait]
+impl Tool for WebFetchTool {
+    fn name(&self) -> &'static str {
+        "web_fetch"
+    }
+
+    fn description(&self) -> &'static str {
+        "Fetches a web page URL and converts HTML content into Markdown."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Target web page URL to fetch."
+                }
+            },
+            "required": ["url"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<ToolOutput> {
+        let url_str = args["url"].as_str().context("Missing or invalid 'url' argument")?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()?;
+
+        let res = client.get(url_str).header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64)").send().await;
+
+        match res {
+            Ok(resp) => {
+                let body = resp.text().await.unwrap_or_default();
+                let markdown = html2md::parse_html(&body);
+                let limit = 8000;
+                if markdown.len() > limit {
+                    Ok(ToolOutput::new_truncated(markdown[..limit].to_string(), markdown.len()))
+                } else {
+                    Ok(ToolOutput::new(markdown))
+                }
+            }
+            Err(e) => Ok(ToolOutput::new(format!("Web fetch error: {}", e))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,5 +820,48 @@ mod tests {
         assert!(res.content.contains("Exit code: 0"));
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ast_tools() -> Result<()> {
+        let dir = tempdir()?;
+        let file_path = dir.path().join("sample.rs");
+        fs::write(&file_path, "pub struct SampleStruct;\npub fn sample_function() {}\n")?;
+
+        let def_tool = FindDefinitionTool;
+        let def_res = def_tool.execute(json!({
+            "symbol": "SampleStruct",
+            "path": dir.path().to_string_lossy()
+        })).await?;
+        assert!(def_res.content.contains("Definition of 'SampleStruct'"));
+
+        let sym_tool = ListSymbolsTool;
+        let sym_res = sym_tool.execute(json!({
+            "path": file_path.to_string_lossy()
+        })).await?;
+        assert!(sym_res.content.contains("struct SampleStruct"));
+        assert!(sym_res.content.contains("fn sample_function"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_tool_registry_modes() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(ReadFileTool));
+        reg.register(Arc::new(WriteFileTool));
+        reg.register(Arc::new(EditFileTool));
+        reg.register(Arc::new(ListDirTool));
+        reg.register(Arc::new(GrepTool));
+
+        let plan_reg = reg.for_mode(AgentMode::Plan);
+        assert!(plan_reg.get("read_file").is_some());
+        assert!(plan_reg.get("write_file").is_none());
+        assert!(plan_reg.get("edit_file").is_none());
+
+        let explore_reg = reg.for_mode(AgentMode::Explore);
+        assert!(explore_reg.get("read_file").is_some());
+        assert!(explore_reg.get("grep").is_some());
+        assert!(explore_reg.get("write_file").is_none());
     }
 }

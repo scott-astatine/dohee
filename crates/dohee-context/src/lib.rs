@@ -1,19 +1,5 @@
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Message {
-    pub role: String, // "system", "user", "assistant", "tool"
-    pub content: String,
-    pub name: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Session {
-    pub messages: Vec<Message>,
-    pub created_at: u64,
-    pub compaction_generation: u32,
-}
+pub use dohee_prompt::{Message, Session};
 
 pub fn count_tokens(model: &dohee_infer::DoheeModel, text: &str) -> usize {
     model.tokenize(text, llama_cpp_2::model::AddBos::Never)
@@ -53,6 +39,7 @@ pub fn compact_history(
     messages: &mut Vec<Message>,
     compaction_gen: &mut u32,
     ctx_size: u32,
+    renderer: &dyn dohee_prompt::PromptRenderer,
 ) -> Result<()> {
     *compaction_gen += 1;
     
@@ -65,14 +52,27 @@ pub fn compact_history(
     
     let mid_messages = messages.iter().skip(1).take(messages.len() - 4).cloned().collect::<Vec<_>>();
     
-    let mut prompt = String::new();
-    prompt.push_str("<|im_start|>system\nYou are a concise summarizer. Summarize the following conversation history between the User and the Assistant into a structured summary containing: Goal, Constraints, Progress, Decisions, Next Steps.\n<|im_end|>\n");
+    // Model-agnostic summarizer instructions represented as standard conversation turn
+    let summarizer_messages = vec![
+        Message {
+            role: "system".to_string(),
+            content: "You are a concise summarizer. Summarize the following conversation history between the User and the Assistant into a structured summary containing: Goal, Constraints, Progress, Decisions, Next Steps.".to_string(),
+            name: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: {
+                let mut content = String::new();
+                for msg in mid_messages {
+                    content.push_str(&format!("{}: {}\n", msg.role, msg.content));
+                }
+                content
+            },
+            name: None,
+        }
+    ];
     
-    prompt.push_str("<|im_start|>user\n");
-    for msg in mid_messages {
-        prompt.push_str(&format!("{}: {}\n", msg.role, msg.content));
-    }
-    prompt.push_str("\nProvide the summary now:\n<|im_end|>\n<|im_start|>assistant\n");
+    let prompt = renderer.render(&summarizer_messages, true)?;
     
     let mut session = dohee_infer::InferenceSession::new(backend, model, ctx_size, None)?;
     session.advance(model, &prompt)?;

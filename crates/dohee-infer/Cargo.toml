@@ -16,6 +16,7 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 encoding_rs = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 clap = { workspace = true }

@@ -1,0 +1,3 @@
+model_path = "models/Gemma-4e3bu-ag.gguf"
+backend = "cuda"
+sandbox_policy = "DangerFullAccess"

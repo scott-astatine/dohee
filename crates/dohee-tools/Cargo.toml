@@ -13,6 +13,13 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 dohee-sandbox = { path = "../dohee-sandbox" }
+tree-sitter = { workspace = true }
+tree-sitter-rust = { workspace = true }
+ignore = { workspace = true }
+globset = { workspace = true }
+html2md = { workspace = true }
+reqwest = { workspace = true }
+urlencoding = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

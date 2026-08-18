@@ -8,6 +8,27 @@ use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::sampling::LlamaSampler;
 use std::num::NonZeroU32;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
+
+static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
+static BACKEND_MUTEX: Mutex<()> = Mutex::new(());
+
+/// Global process-wide singleton accessor for `LlamaBackend`.
+/// Guarantees that `LlamaBackend::init()` is invoked at most once per process,
+/// even when accessed across multiple threads concurrently.
+pub fn backend() -> Result<&'static LlamaBackend> {
+    if let Some(b) = BACKEND.get() {
+        return Ok(b);
+    }
+    let _guard = BACKEND_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(b) = BACKEND.get() {
+        return Ok(b);
+    }
+    let mut b = LlamaBackend::init().context("Failed to initialize llama.cpp backend")?;
+    b.void_logs();
+    let _ = BACKEND.set(b);
+    Ok(BACKEND.get().expect("Backend once_lock initialized"))
+}
 
 pub struct DoheeModel {
     pub model: LlamaModel,
@@ -28,6 +49,7 @@ impl DoheeModel {
 
         let model = LlamaModel::load_from_file(backend, path, &model_params)
             .context("Failed to load llama model from file")?;
+        
         Ok(Self { model })
     }
 
@@ -66,6 +88,7 @@ impl<'a> InferenceSession<'a> {
         let mut ctx_params = LlamaContextParams::default();
         if ctx_size > 0 {
             ctx_params = ctx_params.with_n_ctx(Some(NonZeroU32::new(ctx_size).unwrap()));
+            ctx_params = ctx_params.with_n_batch(ctx_size);
         }
         if let Some(t) = threads {
             ctx_params = ctx_params.with_n_threads(t);
@@ -74,7 +97,8 @@ impl<'a> InferenceSession<'a> {
         let ctx = model.model.new_context(backend, ctx_params)
             .context("Failed to create context")?;
         
-        let batch = LlamaBatch::new(512, 1);
+        let batch_size = if ctx_size > 0 { ctx_size } else { 2048 };
+        let batch = LlamaBatch::new(batch_size as usize, 1);
         
         Ok(Self {
             ctx,
@@ -85,13 +109,7 @@ impl<'a> InferenceSession<'a> {
     }
 
     pub fn advance(&mut self, model: &DoheeModel, text: &str) -> Result<()> {
-        let add_bos = if self.n_past == 0 {
-            AddBos::Always
-        } else {
-            AddBos::Never
-        };
-
-        let tokens = model.tokenize(text, add_bos)?;
+        let tokens = model.tokenize(text, AddBos::Never)?;
         if tokens.is_empty() {
             return Ok(());
         }
@@ -166,3 +184,31 @@ pub fn grammar_sampler(
         ]))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_concurrent_backend_init() {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let b = backend();
+                    if let Err(ref e) = b {
+                        eprintln!("Backend init error: {:?}", e);
+                    }
+                    assert!(b.is_ok());
+                    let ptr1 = b.unwrap() as *const LlamaBackend as usize;
+                    ptr1
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for ptr in &results {
+            assert_eq!(*ptr, results[0], "All threads must receive identical LlamaBackend reference");
+        }
+    }
+}
+

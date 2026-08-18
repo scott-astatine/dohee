@@ -47,6 +47,30 @@ impl Store {
             [],
         ).context("Failed to create messages table")?;
 
+        // Create symbols_index table
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS symbols_index (
+                file_path TEXT PRIMARY KEY,
+                content_hash TEXT NOT NULL,
+                symbols_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )",
+            [],
+        ).context("Failed to create symbols_index table")?;
+
+        // Create file_snapshots table
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS file_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                content TEXT NOT NULL,
+                snapshot_type TEXT NOT NULL,
+                timestamp INTEGER NOT NULL
+            )",
+            [],
+        ).context("Failed to create file_snapshots table")?;
+
         Ok(())
     }
 
@@ -141,6 +165,64 @@ impl Store {
             list.push(r.context("Failed to parse session list row")?);
         }
         Ok(list)
+    }
+
+    pub fn save_symbol_index(&mut self, file_path: &str, content_hash: &str, symbols_json: &str) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        self.conn.execute(
+            "INSERT OR REPLACE INTO symbols_index (file_path, content_hash, symbols_json, updated_at) VALUES (?1, ?2, ?3, ?4)",
+            params![file_path, content_hash, symbols_json, now],
+        ).context("Failed to save symbol index")?;
+        Ok(())
+    }
+
+    pub fn get_symbol_index(&self, file_path: &str) -> Result<Option<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT content_hash, symbols_json FROM symbols_index WHERE file_path = ?1"
+        ).context("Failed to prepare symbol index SELECT statement")?;
+
+        let mut rows = stmt.query_map(params![file_path], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        if let Some(res) = rows.next() {
+            Ok(Some(res.context("Failed to parse symbol index row")?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn save_file_snapshot(&mut self, session_id: &str, file_path: &str, content: &str, snapshot_type: &str) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        self.conn.execute(
+            "INSERT INTO file_snapshots (session_id, file_path, content, snapshot_type, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![session_id, file_path, content, snapshot_type, now],
+        ).context("Failed to insert file snapshot")?;
+        Ok(())
+    }
+
+    pub fn get_latest_snapshot(&self, session_id: &str, file_path: &str, snapshot_type: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT content FROM file_snapshots WHERE session_id = ?1 AND file_path = ?2 AND snapshot_type = ?3 ORDER BY id DESC LIMIT 1"
+        ).context("Failed to prepare file snapshot SELECT statement")?;
+
+        let mut rows = stmt.query_map(params![session_id, file_path, snapshot_type], |row| {
+            row.get::<_, String>(0)
+        })?;
+
+        if let Some(res) = rows.next() {
+            Ok(Some(res.context("Failed to parse file snapshot row")?))
+        } else {
+            Ok(None)
+        }
     }
 }
 

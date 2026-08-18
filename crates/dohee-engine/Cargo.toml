@@ -1,36 +1,29 @@
 [package]
-name = "dohee-cli"
+name = "dohee-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
-[[bin]]
-name = "dohee"
-path = "src/main.rs"
-
 [features]
+default = []
 vulkan = ["dohee-infer/vulkan"]
 cuda = ["dohee-infer/cuda"]
 
 [dependencies]
-# Local crates
 dohee-core = { path = "../dohee-core" }
 dohee-infer = { path = "../dohee-infer" }
 dohee-tools = { path = "../dohee-tools" }
 dohee-sandbox = { path = "../dohee-sandbox" }
 dohee-context = { path = "../dohee-context" }
 dohee-store = { path = "../dohee-store" }
-dohee-mcp = { path = "../dohee-mcp" }
 dohee-config = { path = "../dohee-config" }
-dohee-tui = { path = "../dohee-tui" }
-dohee-prompt = { path = "../dohee-prompt" }
 
-# Inherited dependencies
-tokio = { workspace = true }
-anyhow = { workspace = true }
-clap = { workspace = true }
-llama-cpp-2 = { workspace = true }
-sha2 = "0.10"
-ignore = { workspace = true }
+tokio = { version = "1.38", features = ["rt", "sync", "time"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1.38", features = ["rt-multi-thread", "macros"] }

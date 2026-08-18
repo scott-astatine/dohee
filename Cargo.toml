@@ -11,6 +11,8 @@ members = [
     "crates/dohee-config",
     "crates/dohee-tui",
     "crates/dohee-cli",
+    "crates/dohee-engine",
+    "crates/dohee-prompt",
 ]
 
 [workspace.package]
@@ -39,6 +41,7 @@ toml = "0.8"
 
 # Subcrate specific dependencies
 llama-cpp-2 = { version = "0.1.150", default-features = false }
+minijinja = "2.12"
 landlock = "0.4"
 rusqlite = { version = "0.31", features = ["bundled"] }
 ratatui = "0.26"
@@ -46,9 +49,16 @@ encoding_rs = "0.8"
 tempfile = "3.10"
 async-trait = "0.1"
 crossterm = "0.27"
+arboard = "3.4"
+tree-sitter = "0.22"
+tree-sitter-rust = "0.20"
+ignore = "0.4"
+globset = "0.4"
+html2md = "0.2"
+urlencoding = "2.1"
+reqwest = { version = "0.13", features = ["json", "stream"] }
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"

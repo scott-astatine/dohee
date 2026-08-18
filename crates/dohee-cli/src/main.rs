@@ -6,10 +6,12 @@ use dohee_infer as do_infer;
 use dohee_sandbox as do_sandbox;
 use dohee_store as do_store;
 use dohee_tools as do_tools;
+use dohee_tools::Tool;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use sha2::Digest;
 
 #[derive(Parser, Debug)]
 #[command(name = "dohee", version = "0.1.0", about = "A local-first AI coding agent. No cloud required.")]
@@ -33,6 +35,10 @@ struct Cli {
     /// Disable grammar-constrained tool calling
     #[arg(long)]
     no_grammar: bool,
+
+    /// Path to custom Jinja template or name (e.g. "chatml")
+    #[arg(long)]
+    chat_template: Option<String>,
 
     /// Optional raw prompt for single-shot execution
     prompt: Option<String>,
@@ -63,6 +69,12 @@ enum Commands {
     },
     /// Check system hardware, model path, Vulkan compatibility, and sandbox support
     Doctor,
+    /// Build/refresh AST symbol index for workspace
+    Index {
+        /// Target path to index (defaults to '.')
+        #[arg(default_value = ".")]
+        path: String,
+    },
 }
 
 fn get_config_paths() -> (Option<PathBuf>, Option<PathBuf>) {
@@ -121,19 +133,41 @@ async fn run_agent_session(
     registry.register(Arc::new(do_tools::ListDirTool));
     registry.register(Arc::new(do_tools::GrepTool));
     registry.register(Arc::new(do_tools::RunShellTool::new(sandbox_policy.clone())));
+    registry.register(Arc::new(do_tools::FindDefinitionTool));
+    registry.register(Arc::new(do_tools::ListSymbolsTool));
 
-    // 3. Inject system prompt if this is a fresh session
-    if session.messages.is_empty() {
+    // 3. Inject system prompt if it is missing
+    let has_system = session.messages.iter().any(|m| m.role == "system");
+    if !has_system {
         let sys_prompt = do_core::system_prompt(&registry.list());
-        session.messages.push(do_core::Message {
+        session.messages.insert(0, do_core::Message {
             role: "system".to_string(),
             content: sys_prompt,
             name: None,
         });
     }
 
-    // 4. Instantiate Agent
-    let mut agent = do_core::Agent::new(&model, &backend, registry, sandbox_policy);
+    // 4. Resolve template source
+    let template_source = if let Some(ref custom_tpl) = config.chat_template {
+        let path = Path::new(custom_tpl);
+        if path.exists() {
+            dohee_prompt::PromptTemplate::External(path.to_path_buf())
+        } else {
+            dohee_prompt::PromptTemplate::Builtin(custom_tpl.clone())
+        }
+    } else if let Ok(embedded_tpl) = model.model.meta_val_str("tokenizer.chat_template") {
+        dohee_prompt::PromptTemplate::Embedded(embedded_tpl)
+    } else {
+        anyhow::bail!(
+            "No chat template was found in the GGUF model metadata, and no custom template was configured via --chat-template or configuration file. Please specify a chat template to proceed."
+        );
+    };
+
+    let renderer = Arc::new(dohee_prompt::JinjaRenderer::new(template_source)
+        .context("Failed to initialize Jinja chat template renderer")?);
+
+    // 5. Instantiate Agent
+    let mut agent = do_core::Agent::new(&model, &backend, registry, sandbox_policy, renderer);
     agent.temperature = config.temperature;
     agent.seed = config.seed;
     agent.use_grammar = !no_grammar;
@@ -160,6 +194,7 @@ async fn main() -> Result<()> {
         backend: cli.backend,
         ctx_size: cli.ctx_size,
         gpu_layers: cli.gpu_layers,
+        chat_template: cli.chat_template,
         ..Default::default()
     };
 
@@ -314,6 +349,47 @@ async fn main() -> Result<()> {
                 println!("UNSUPPORTED (Landlock LSM sandboxing is only available on Linux)");
             }
             println!("--------------------------------------");
+        }
+        Some(Commands::Index { path }) => {
+            println!("=== Indexing AST Symbols in '{}' ===", path);
+            let db_path = get_db_path()?;
+            let mut store = do_store::Store::open(db_path)?;
+            let mut indexed_count = 0;
+
+            for entry in ignore::WalkBuilder::new(&path).hidden(false).parents(true).build() {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                let entry_path = entry.path();
+                if entry_path.is_file() && entry_path.extension().map_or(false, |ext| ext == "rs") {
+                    if let Ok(source) = fs::read_to_string(entry_path) {
+                        let hash = format!("{:x}", sha2::Sha256::digest(source.as_bytes()));
+                        
+                        // Check cached index
+                        let cached = store.get_symbol_index(&entry_path.to_string_lossy())?;
+                        if let Some((cached_hash, _)) = cached {
+                            if cached_hash == hash {
+                                continue;
+                            }
+                        }
+
+                        // Parse file AST
+                        let sym_tool = do_tools::ListSymbolsTool;
+                        let sym_res = sym_tool.execute(serde_json::json!({
+                            "path": entry_path.to_string_lossy()
+                        })).await?;
+
+                        store.save_symbol_index(
+                            &entry_path.to_string_lossy(),
+                            &hash,
+                            &sym_res.content,
+                        )?;
+                        indexed_count += 1;
+                    }
+                }
+            }
+            println!("Successfully indexed/refreshed {} source files in AST store.", indexed_count);
         }
         None => {
             println!("No subcommand or prompt provided. Run 'dohee --help' for details.");
